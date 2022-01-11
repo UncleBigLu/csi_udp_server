@@ -23,9 +23,215 @@
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 
+#include <math.h>
+
 #define PORT CONFIG_EXAMPLE_PORT
 
-static const char *TAG = "example";
+static const char *TAG = "udp_server";
+
+// Init AP and wifi connect event
+#define EXAMPLE_ESP_WIFI_SSID      "udp_server_ap"
+#define EXAMPLE_ESP_WIFI_PASS      "iloveSCU"
+#define EXAMPLE_ESP_WIFI_CHANNEL   1
+#define EXAMPLE_MAX_STA_CONN       4
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+void wifi_init_softap(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+            .ap = {
+                    .ssid = EXAMPLE_ESP_WIFI_SSID,
+                    .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
+                    .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+                    .password = EXAMPLE_ESP_WIFI_PASS,
+                    .max_connection = EXAMPLE_MAX_STA_CONN,
+                    .authmode = WIFI_AUTH_WPA_WPA2_PSK
+            },
+    };
+    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+}
+// End of init ap
+// Config CSI
+
+// Set true to print CSI frequency to serial
+#define COUNT_CSI_FREQUENCY 0
+#define PRINT_TIMESTAMP 0
+// Count CSI data frequency
+static uint32_t last_CSI_fre_time = 0;
+static uint16_t csi_count = 0;
+static QueueHandle_t csi_queue;
+
+static void print_csi_freq_task() {
+    while (1)
+    {
+        printf("csi_count: %u\n", csi_count);
+        csi_count = 0;
+        vTaskDelay(1000/portTICK_PERIOD_MS);
+    }
+}
+
+static void _get_subcarrier_csi(const int8_t* csi_data, uint16_t subcarrier_index, int8_t* imagin, int8_t* real)
+{
+    *imagin = csi_data[2*subcarrier_index];
+    *real = csi_data[2*subcarrier_index + 1];
+}
+
+static void serial_print_csi_task() {
+    uint8_t window_len = 10;
+    float win[window_len];
+    for(uint8_t i = 0; i < window_len; ++i)
+        win[i] = 0;
+    uint8_t ptr = 0;
+
+    // UDP Client part. Send CSI data to python UDP Server.
+    char *host_ip = "dell-pc.local";
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr("192.168.4.2");
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(9999);
+    int addr_family = AF_INET;
+    int ip_protocol = IPPROTO_IP;
+
+    while (1)
+    {
+        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+        if(sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            break;
+        }
+        while (1) {
+            // Get CSI from queue
+            wifi_csi_info_t* data = NULL;
+            xQueueReceive(csi_queue, &data, portMAX_DELAY);
+            // Get average csi of all subcarrier
+            uint16_t csi_length = data->len;
+            uint16_t start_subcarrier = data->first_word_invalid ? 2 : 0;
+            float csi_avg = 0;
+            int8_t img, real;
+            for(uint16_t i = start_subcarrier; i < csi_length; ++i) {
+                _get_subcarrier_csi(data->buf, i, &img, &real);
+                csi_avg += (sqrtf(pow(img, 2) + pow(real, 2))) / csi_length;
+            }
+            win[ptr] = csi_avg;
+            ptr = (ptr+1) % window_len;
+            float csi_filtered = 0;
+            for(uint8_t i = 0; i < window_len; ++i) {
+                csi_filtered += win[i]/window_len;
+            }
+
+            // Send data to UDP server
+            int err = sendto(sock, &csi_filtered, sizeof(csi_filtered), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+            if(err < 0) {
+                ESP_LOGE(TAG, "Error occur during sending: errno: %d", errno);
+                break;
+            }
+
+            printf("%.2f ", csi_filtered);
+            if(PRINT_TIMESTAMP)
+            {
+                // Get timestamp from data ctrl field
+                // This field is the local time when this packet is received.
+                // It is precise only if modem sleep or light sleep is not enabled.
+                // Unit: microsecond
+                uint32_t timestamp = data->rx_ctrl.timestamp;
+                printf("%u ", timestamp);
+            }
+            printf("\n");
+
+            // Free memory allocated in csi_callback function
+            free(data);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+void csi_callback(void* ctx, wifi_csi_info_t* data) {
+    /*
+     * Best practice:
+     * Do NOT do lengthy operation in this callback function.
+     * Post necessary data to a lower priority task and handle it.
+     * */
+    // Count csi frequency
+    if(COUNT_CSI_FREQUENCY)
+    {
+        csi_count++;
+    }
+    // Copy data into heap memory
+    wifi_csi_info_t* data_cp =(wifi_csi_info_t*)malloc(sizeof(*data));
+    memcpy(data_cp, data, sizeof(*data));
+    // Post data to queue
+    xQueueSendToBack(csi_queue, &data_cp, 0);
+
+    //serial_print_csi(data);
+
+    /*
+     * About the csi data:
+     *   Each channel frequency response of sub-carrier is recorded by two bytes of signed characters.
+     * The first one is imaginary part and the second one is real part.
+     *
+     * Here we're trying to get data from HTLTF field. LLTF and STBC-HTLTF are disabled.
+     * The default bandwidth for ESP32 station and AP is HT40, so handle CSI data with HT40 format.
+     *
+     * */
+}
+
+static void csi_init() {
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
+
+    wifi_csi_config_t csicfg;
+
+    // Try to get raw csi from only ht-ltf.
+    csicfg.lltf_en = false;
+    csicfg.htltf_en = true;
+    csicfg.stbc_htltf2_en = false;
+    // Enable to generate htlft data by averaging lltf and ht_ltf data when receiving HT packet.
+    // Otherwise, use ht_ltf data directly. Default enabled
+    csicfg.ltf_merge_en = false;
+    //enable to turn on channel filter to smooth adjacent sub-carrier.
+    // Disable it to keep independence of adjacent sub-carrier. Default enabled
+    csicfg.channel_filter_en = true;
+    csicfg.manu_scale = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csicfg));
+
+
+
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+}
 
 static void udp_server_task(void *pvParameters)
 {
@@ -75,7 +281,7 @@ static void udp_server_task(void *pvParameters)
 
         while (1) {
 
-            ESP_LOGI(TAG, "Waiting for data");
+            //ESP_LOGI(TAG, "Waiting for data");
             struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
@@ -95,10 +301,11 @@ static void udp_server_task(void *pvParameters)
                 }
 
                 rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
-                ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
-                ESP_LOGI(TAG, "%s", rx_buffer);
+                //ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
+                //ESP_LOGI(TAG, "%s", rx_buffer);
 
-                int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // Turn off data sendback
+                //int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
                 if (err < 0) {
                     ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
                     break;
@@ -118,20 +325,17 @@ static void udp_server_task(void *pvParameters)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
-    ESP_ERROR_CHECK(example_connect());
-
+    csi_queue = xQueueCreate(5, sizeof(wifi_csi_info_t*));
+    wifi_init_softap();
+    csi_init();
 #ifdef CONFIG_EXAMPLE_IPV4
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
 #endif
 #ifdef CONFIG_EXAMPLE_IPV6
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET6, 5, NULL);
 #endif
+    xTaskCreate(serial_print_csi_task, "serial_print_csi", 4096, NULL, 1, NULL);
+    if(COUNT_CSI_FREQUENCY)
+        xTaskCreate(print_csi_freq_task, "print_csi_freq", 2048, NULL, 2, NULL);
 
 }
