@@ -131,7 +131,9 @@ static void serial_print_csi_task() {
         int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
         if(sock < 0) {
             ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            break;
+            vTaskDelay(1000/portTICK_PERIOD_MS);
+            continue;
+            //break;
         }
         while (1) {
             // Get CSI from queue
@@ -157,6 +159,12 @@ static void serial_print_csi_task() {
             int err = sendto(sock, &csi_filtered, sizeof(csi_filtered), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
             if(err < 0) {
                 ESP_LOGE(TAG, "Error occur during sending: errno: %d", errno);
+                free(data);
+                if (sock != -1) {
+                    ESP_LOGE(TAG, "Shutting down socket and restarting...");
+                    shutdown(sock, 0);
+                    close(sock);
+                }
                 break;
             }
 
@@ -293,23 +301,23 @@ static void udp_server_task(void *pvParameters)
             }
             // Data received
             else {
-                // Get the sender's ip address as string
-                if (source_addr.ss_family == PF_INET) {
-                    inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-                } else if (source_addr.ss_family == PF_INET6) {
-                    inet6_ntoa_r(((struct sockaddr_in6 *)&source_addr)->sin6_addr, addr_str, sizeof(addr_str) - 1);
-                }
+//                // Get the sender's ip address as string
+//                if (source_addr.ss_family == PF_INET) {
+//                    inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+//                } else if (source_addr.ss_family == PF_INET6) {
+//                    inet6_ntoa_r(((struct sockaddr_in6 *)&source_addr)->sin6_addr, addr_str, sizeof(addr_str) - 1);
+//                }
 
-                rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
+                //rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
                 //ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
                 //ESP_LOGI(TAG, "%s", rx_buffer);
 
                 // Turn off data sendback
                 //int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
-                if (err < 0) {
-                    ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-                    break;
-                }
+//                if (err < 0) {
+//                    ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+//                    break;
+//                }
             }
         }
 
@@ -334,7 +342,7 @@ void app_main(void)
 #ifdef CONFIG_EXAMPLE_IPV6
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET6, 5, NULL);
 #endif
-    xTaskCreate(serial_print_csi_task, "serial_print_csi", 4096, NULL, 1, NULL);
+    xTaskCreate(serial_print_csi_task, "serial_print_csi", 9192, NULL, 1, NULL);
     if(COUNT_CSI_FREQUENCY)
         xTaskCreate(print_csi_freq_task, "print_csi_freq", 2048, NULL, 2, NULL);
 
