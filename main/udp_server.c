@@ -110,6 +110,7 @@ static void _get_subcarrier_csi(const int8_t* csi_data, uint16_t subcarrier_inde
     *real = csi_data[2*subcarrier_index + 1];
 }
 
+
 static void serial_print_csi_task() {
     uint8_t window_len = 10;
     float win[window_len];
@@ -126,6 +127,13 @@ static void serial_print_csi_task() {
     int addr_family = AF_INET;
     int ip_protocol = IPPROTO_IP;
 
+    struct Csi_avg {
+        float l_img_avg;
+        float l_real_avg;
+        float ht_img_avg;
+        float ht_real_avg
+    } csi_avg;
+
     while (1)
     {
         int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
@@ -139,24 +147,69 @@ static void serial_print_csi_task() {
             // Get CSI from queue
             wifi_csi_info_t* data = NULL;
             xQueueReceive(csi_queue, &data, portMAX_DELAY);
-            // Get average csi of all subcarrier
-            uint16_t csi_length = data->len;
-            uint16_t start_subcarrier = data->first_word_invalid ? 2 : 0;
-            float csi_avg = 0;
-            int8_t img, real;
-            for(uint16_t i = start_subcarrier; i < csi_length; ++i) {
-                _get_subcarrier_csi(data->buf, i, &img, &real);
-                csi_avg += (sqrtf(pow(img, 2) + pow(real, 2))) / csi_length;
-            }
-            win[ptr] = csi_avg;
-            ptr = (ptr+1) % window_len;
-            float csi_filtered = 0;
-            for(uint8_t i = 0; i < window_len; ++i) {
-                csi_filtered += win[i]/window_len;
+
+            // Discard csi from macbook, only obtain csi from other esp32
+            if(data->mac[1] != 75){
+                free(data);
+                continue;
             }
 
+//            printf("sigmode: %d\nchannel bandwidth:%d\n", data->rx_ctrl.sig_mode, data->rx_ctrl.cwb);
+//            printf("stbc: %d\nsecondary_channel: %u\n", data->rx_ctrl.stbc, data->rx_ctrl.secondary_channel);
+//            printf("channel: %u\n", data->rx_ctrl.channel);
+//            printf("datalen: %u\n", data->len);
+
+            // Calculate Covariance between lltf avg and htltf avg
+            if(data->rx_ctrl.sig_mode == 0) // non HT(11bg)mode, only contain lltf
+            {
+                free(data);
+                continue;
+            }
+
+            uint16_t csi_length = data->len;
+            uint16_t start_subcarrier = data->first_word_invalid ? 2 : 0;
+
+            float ht_img_avg = 0, ht_real_avg = 0;
+            float l_img_avg = 0, l_real_avg = 0;
+            int8_t img, real;
+            uint8_t ht_subc_num, l_subc_num;
+            if(data->rx_ctrl.cwb == 1) { // 40MHz bandwidth
+                // In 40MHz the lltf subcarrier index is 0-63 or -64~-1, so 64 subcarrier in total
+                l_subc_num = 64;
+                // In 40MHz the htltf subcarrier index is 0-63, -64-1(none STBC) or 0~60, -60~-1(STBC).
+                ht_subc_num = data->rx_ctrl.stbc ? 121:128;
+            }
+            else { // 20Mhz bandwidth
+                l_subc_num = 64;
+                if(data->rx_ctrl.secondary_channel == 2)// below
+                    ht_subc_num = data->rx_ctrl.stbc ? 63 : 64;
+                else if(data->rx_ctrl.secondary_channel == 1)// above
+                    ht_subc_num = data->rx_ctrl.stbc ? 62 : 64;
+                else // none
+                    ht_subc_num = 64;
+            }
+            // Get average LLTF imagine and real part.
+            for(uint16_t i = start_subcarrier; i < l_subc_num; ++i) {
+                _get_subcarrier_csi(data->buf, i, &img, &real);
+                l_img_avg += ((float)img) / (l_subc_num - start_subcarrier);
+                l_real_avg += ((float)real) / (l_subc_num - start_subcarrier);
+            }
+
+            // Get average HTltf imagine and real part
+
+            for(uint16_t i = l_subc_num; i < l_subc_num + ht_subc_num; ++i) {
+                _get_subcarrier_csi(data->buf, i, &img, &real);
+                ht_img_avg += ((float)img) / ht_subc_num;
+                ht_real_avg += ((float)real) / ht_subc_num;
+            }
+
+            csi_avg.ht_real_avg = ht_real_avg;
+            csi_avg.ht_img_avg = ht_img_avg;
+            csi_avg.l_img_avg = l_img_avg;
+            csi_avg.l_real_avg = l_real_avg;
+
             // Send data to UDP server
-            int err = sendto(sock, &csi_filtered, sizeof(csi_filtered), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+            int err = sendto(sock, &csi_avg, sizeof(csi_avg), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
             if(err < 0) {
                 ESP_LOGE(TAG, "Error occur during sending: errno: %d", errno);
                 free(data);
@@ -168,7 +221,7 @@ static void serial_print_csi_task() {
                 break;
             }
 
-            printf("%.2f ", csi_filtered);
+            printf("%.2f ", csi_avg.ht_real_avg);
             if(PRINT_TIMESTAMP)
             {
                 // Get timestamp from data ctrl field
@@ -211,7 +264,6 @@ void csi_callback(void* ctx, wifi_csi_info_t* data) {
      *   Each channel frequency response of sub-carrier is recorded by two bytes of signed characters.
      * The first one is imaginary part and the second one is real part.
      *
-     * Here we're trying to get data from HTLTF field. LLTF and STBC-HTLTF are disabled.
      * The default bandwidth for ESP32 station and AP is HT40, so handle CSI data with HT40 format.
      *
      * */
@@ -222,8 +274,7 @@ static void csi_init() {
 
     wifi_csi_config_t csicfg;
 
-    // Try to get raw csi from only ht-ltf.
-    csicfg.lltf_en = false;
+    csicfg.lltf_en = true;
     csicfg.htltf_en = true;
     csicfg.stbc_htltf2_en = false;
     // Enable to generate htlft data by averaging lltf and ht_ltf data when receiving HT packet.
